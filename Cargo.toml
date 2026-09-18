@@ -1,0 +1,19 @@
+[package]
+name = "unit-lint"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Find systemd units that are valid but silently broken — in a built NixOS system and on the running host"
+repository = "https://github.com/achimcc/unit-lint"
+readme = "README.md"
+keywords = ["systemd", "nixos", "lint", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+lexopt = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+
+[profile.release]
+lto = true
