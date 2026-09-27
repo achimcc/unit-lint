@@ -1,7 +1,10 @@
 //! Checks against the running system: what the unit files cannot tell.
 //!
 //! Runs on the host, as root, and reaches into containers with
-//! `systemctl -M` and through `/proc/<leader>/root/proc`.
+//! `systemctl -M`. A guest process is read on the HOST's `/proc`, found
+//! through the unit's cgroup — never through `/proc/<leader>/root/proc`, a
+//! path whose every component guest root controls (audit 3 of the
+//! homeserver, B86).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -100,7 +103,9 @@ fn caps_names(mask: u64) -> String {
 pub trait Host {
     fn machines(&self) -> Result<Vec<String>, String>;
     fn show_units(&self, machine: Option<&str>) -> Result<String, String>;
-    fn proc_status(&self, machine: Option<&str>, pid: u32) -> Option<String>;
+    /// `/proc/<pid>/status` of `unit`'s main process; `pid` as the unit's own
+    /// systemd sees it (inside a guest: its pid namespace).
+    fn proc_status(&self, machine: Option<&str>, unit: &str, pid: u32) -> Option<String>;
 }
 
 const PROPERTIES: &str = "Id,LoadState,ActiveState,SubState,MainPID,CapabilityBoundingSet";
@@ -168,7 +173,7 @@ pub fn check_system(
         if id.ends_with(".service") && active == "active" && pid > 0 && load == "loaded" {
             let (Some(unit_mask), Some(status)) = (
                 caps_mask(get("CapabilityBoundingSet")),
-                host.proc_status(machine, pid),
+                host.proc_status(machine, id, pid),
             ) else {
                 continue;
             };
@@ -254,13 +259,64 @@ impl Host for RealHost {
         run("systemctl", &args)
     }
 
-    fn proc_status(&self, machine: Option<&str>, pid: u32) -> Option<String> {
-        let path = match machine {
-            None => format!("/proc/{pid}/status"),
-            Some(m) => format!("/proc/{}/root/proc/{pid}/status", self.leader(m)?),
+    fn proc_status(&self, machine: Option<&str>, unit: &str, pid: u32) -> Option<String> {
+        let Some(m) = machine else {
+            return read_capped(&format!("/proc/{pid}/status"));
         };
-        std::fs::read_to_string(path).ok()
+        let cgroup = read_capped(&format!("/proc/{}/cgroup", self.leader(m)?))?;
+        let procs = read_capped(&unit_procs_path(&cgroup, unit)?)?;
+        status_by_nspid(&procs, pid, |p| read_capped(&format!("/proc/{p}/status")))
     }
+}
+
+/// Every file here is the kernel's (procfs, cgroupfs on the host), but none
+/// is read without a limit: 1 MiB is far beyond any status or cgroup.procs.
+fn read_capped(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut s = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(1 << 20)
+        .read_to_string(&mut s)
+        .ok()?;
+    Some(s)
+}
+
+/// `…/payload/system.slice/<unit>/cgroup.procs` of the guest whose leader
+/// sits in `leader_cgroup` (`/proc/<leader>/cgroup`, cgroup v2). `None` for a
+/// unit name systemd would not accept — it comes from the guest, and `/` or
+/// `..` in it would walk the host's cgroup tree.
+fn unit_procs_path(leader_cgroup: &str, unit: &str) -> Option<String> {
+    let valid = !unit.is_empty()
+        && !unit.starts_with('.')
+        && unit.len() <= 255
+        && unit
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":_.\\@-".contains(&b));
+    if !valid {
+        return None;
+    }
+    let path = leader_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let (payload, _) = path.trim().rsplit_once('/')?;
+    Some(format!(
+        "/sys/fs/cgroup{payload}/system.slice/{unit}/cgroup.procs"
+    ))
+}
+
+/// The status of the host process in `procs` (host pids) whose innermost
+/// pid is `pid`. The match is on `NSpid`, which the kernel writes.
+fn status_by_nspid(procs: &str, pid: u32, read: impl Fn(u32) -> Option<String>) -> Option<String> {
+    procs
+        .split_whitespace()
+        .filter_map(|p| p.parse::<u32>().ok())
+        .filter_map(read)
+        .find(|st| {
+            st.lines()
+                .find_map(|l| l.strip_prefix("NSpid:"))
+                .and_then(|v| v.split_whitespace().last())
+                .and_then(|v| v.parse::<u32>().ok())
+                == Some(pid)
+        })
 }
 
 #[cfg(test)]
@@ -276,9 +332,48 @@ mod tests {
         fn show_units(&self, _: Option<&str>) -> Result<String, String> {
             Ok(self.0.to_owned())
         }
-        fn proc_status(&self, _: Option<&str>, pid: u32) -> Option<String> {
+        fn proc_status(&self, _: Option<&str>, _: &str, pid: u32) -> Option<String> {
             self.1.get(&pid).map(|s| (*s).to_owned())
         }
+    }
+
+    /// B86: the path to a guest unit's processes is built from the kernel's
+    /// cgroup file of the leader, and a unit name from the guest cannot walk
+    /// out of the guest's subtree.
+    #[test]
+    fn guest_unit_procs_path_stays_in_the_guest() {
+        let cg = "0::/machine.slice/systemd-nspawn@media-01.service/payload/init.scope\n";
+        assert_eq!(
+            unit_procs_path(cg, "sonarr.service").as_deref(),
+            Some(
+                "/sys/fs/cgroup/machine.slice/systemd-nspawn@media-01.service/payload/system.slice/sonarr.service/cgroup.procs"
+            )
+        );
+        for bad in [
+            "../../../x",
+            "a/b.service",
+            "..",
+            ".x",
+            "",
+            "a b.service",
+            "x\u{1b}.service",
+        ] {
+            assert_eq!(unit_procs_path(cg, bad), None, "{bad:?}");
+        }
+        assert_eq!(unit_procs_path("garbage", "a.service"), None);
+    }
+
+    #[test]
+    fn the_host_process_is_found_by_its_innermost_pid() {
+        let st = |p: u32| match p {
+            9001 => Some("Name:\tx\nNSpid:\t9001\t12\nCapBnd:\t0000000000000001\n".to_owned()),
+            9002 => Some("Name:\ty\nNSpid:\t9002\t34\nCapBnd:\t0000000000000003\n".to_owned()),
+            _ => None,
+        };
+        let got = status_by_nspid("9001\n9002\n", 34, st).unwrap();
+        assert!(got.contains("Name:\ty"));
+        assert_eq!(status_by_nspid("9001\n", 34, st), None);
+        assert_eq!(status_by_nspid("junk\n", 34, st), None);
     }
 
     #[test]

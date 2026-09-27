@@ -1,6 +1,6 @@
 [package]
 name = "unit-lint"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "Find systemd units that are valid but silently broken — in a built NixOS system and on the running host"
