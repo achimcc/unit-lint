@@ -41,6 +41,7 @@ A NixOS toplevel brings its declarative containers along
 | `oneshot-restart-forever` | `Type=oneshot` with `Restart=`, where the restart delay is too long for the start limit to ever trip. It never becomes `failed`, and everything waiting for it waits forever. |
 | `oneshot-waits-in-boot` | in a container: a oneshot in `multi-user.target` without a start timeout whose script polls in a loop. The container never finishes booting. |
 | `podman-mount-namespace` | a podman unit with a sandbox option that gives it a mount namespace. ExecStop cannot enter the container's network namespace, and the stale DNAT rule shadows the port. |
+| `implicit-errexit` | a NixOS unit script (`script`, `preStart`, `postStop` …) that opens with its own `set -uo pipefail`. NixOS has already put `set -e` in front of it, so the first failing assignment ends the script silently and the error handling below is dead text. Say `set -euo pipefail` or `set +e`. |
 
 **live** — asks the running system (as root; `--all-machines` includes
 every running systemd-nspawn container):
@@ -95,6 +96,13 @@ error.
 - `oneshot-waits-in-boot` reads the `ExecStart=` script and looks for an
   `until`/`while` loop with a `sleep`. It sees shell scripts, not a wait
   hidden in a compiled program.
+- `implicit-errexit` only looks at scripts NixOS generated — a shebang
+  followed by `set -e` — and only when the text after that opens with `set`
+  lines of its own. A script without any `set` line says nothing about what
+  its author assumed and is left alone; so is a hand-written wrapper
+  (`writeShellScript`), which gets no `set -e` from NixOS. Any later line
+  starting with `set` that names errexit counts as the declaration, even
+  inside a here-document.
 - `check` reads only the unit directory it is given. Units that exist only
   at runtime (generators, transient units) are unknown to it.
 - `live` needs root, and for containers `machinectl`.

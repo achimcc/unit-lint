@@ -87,6 +87,18 @@ pub const RULES: &[Rule] = &[
                   at an address nobody has — a 502 behind a proxy, while every unit is green.",
         check: podman_mount_namespace,
     },
+    Rule {
+        id: "implicit-errexit",
+        summary: "NixOS script whose own `set` line does not mention errexit",
+        explain: "NixOS puts `set -e` in front of every `script`, `preStart`, `postStop` … of \
+                  a unit. A script that then opens with its own `set -uo pipefail` was written \
+                  as if errexit were off: the first failing assignment (`x=$(curl …)`) ends it \
+                  without a word, and the error handling below is unreachable — a check that \
+                  can only report success, a cleanup branch that never runs. Say which one is \
+                  meant: `set -euo pipefail` if the script should stop at the first error, \
+                  `set +e` if it carries its own verdict.",
+        check: implicit_errexit,
+    },
 ];
 
 fn finding(sys: &System, unit: &str, rule: &'static str, message: String) -> Finding {
@@ -442,6 +454,105 @@ fn podman_mount_namespace(sys: &System, out: &mut Vec<Finding>) {
     }
 }
 
+/// Every key under `[Service]` that runs a program.
+const EXEC_KEYS: &[&str] = &[
+    "ExecCondition",
+    "ExecStartPre",
+    "ExecStart",
+    "ExecStartPost",
+    "ExecReload",
+    "ExecStop",
+    "ExecStopPost",
+];
+
+/// Does this `set` line switch errexit on or off, in so many words?
+/// `set -euo pipefail`, `set +e`, `set -o errexit`. An option's argument
+/// (`pipefail` after `-o`) is not a flag and is skipped.
+fn names_errexit(line: &str) -> bool {
+    let line = line.split(" #").next().unwrap_or(line);
+    let mut words = line
+        .split([' ', '\t', ';'])
+        .filter(|w| !w.is_empty())
+        .skip(1);
+    while let Some(w) = words.next() {
+        let Some(flags) = w.strip_prefix(['-', '+']) else {
+            continue;
+        };
+        if flags.starts_with('-') {
+            break;
+        }
+        if flags.contains('e') {
+            return true;
+        }
+        if flags.contains('o') && words.next() == Some("errexit") {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_set_line(line: &str) -> bool {
+    let l = line.trim();
+    l.starts_with("set -") || l.starts_with("set +")
+}
+
+/// The `set` line that gives the script away, if it is one of NixOS's unit
+/// scripts (shebang, then `set -e`, then the author's text) whose text opens
+/// with `set` lines that never mention errexit — and no later line does.
+pub fn undeclared_errexit(text: &str) -> Option<&str> {
+    let mut lines = text.lines();
+    if !lines.next()?.starts_with("#!") {
+        return None;
+    }
+    if lines.by_ref().find(|l| !l.trim().is_empty())?.trim() != "set -e" {
+        return None;
+    }
+    let body: Vec<&str> = lines.collect();
+    let opening: Vec<&str> = body
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .take_while(|l| is_set_line(l))
+        .collect();
+    let first = *opening.first()?;
+    if body
+        .iter()
+        .any(|l| is_set_line(l) && names_errexit(l.trim()))
+    {
+        return None;
+    }
+    Some(first)
+}
+
+fn implicit_errexit(sys: &System, out: &mut Vec<Finding>) {
+    for u in services(sys) {
+        let hit = EXEC_KEYS
+            .iter()
+            .flat_map(|key| u.list("Service", key))
+            .map(exec_path)
+            .find_map(|path| {
+                let meta = fs::metadata(path).ok()?;
+                if !meta.is_file() || meta.len() > 2 * 1024 * 1024 {
+                    return None;
+                }
+                let text = fs::read_to_string(path).ok()?;
+                let line = undeclared_errexit(&text)?.to_owned();
+                Some((path, line))
+            });
+        if let Some((path, line)) = hit {
+            out.push(finding(
+                sys,
+                &u.name,
+                "implicit-errexit",
+                format!(
+                    "{} runs under NixOS's `set -e` and opens with `{line}` — say `set -e` or `set +e`",
+                    path.rsplit('/').next().unwrap_or(path)
+                ),
+            ));
+        }
+    }
+}
+
 pub fn check(sys: &System, only: &[String]) -> Vec<Finding> {
     let mut out = Vec::new();
     for r in RULES {
@@ -466,6 +577,32 @@ mod tests {
             expand_specifiers("x@%i.service", "a@b.service"),
             "x@b.service"
         );
+    }
+
+    #[test]
+    fn errexit_named() {
+        for yes in [
+            "set -euo pipefail",
+            "set -e",
+            "set +e",
+            "set -ue",
+            "set -o errexit",
+            "set -u -o pipefail -o errexit",
+            "set +o errexit",
+            "set -eu # strict",
+        ] {
+            assert!(names_errexit(yes), "{yes}");
+        }
+        for no in [
+            "set -uo pipefail",
+            "set -u",
+            "set -o pipefail",
+            "set -x",
+            "set -o nounset # errexit is on anyway",
+            "set -- -e",
+        ] {
+            assert!(!names_errexit(no), "{no}");
+        }
     }
 
     #[test]

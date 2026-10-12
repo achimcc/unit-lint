@@ -241,6 +241,60 @@ fn podman_mount_namespace() {
 }
 
 #[test]
+fn implicit_errexit() {
+    let d = Dir::new("errexit");
+    // What NixOS renders for `script = ''…''`: shebang, `set -e`, the text.
+    let nixos = |name: &str, body: &str| {
+        d.file(
+            &format!("scripts/{name}"),
+            &format!("#!/bin/bash\nset -e\n\n{body}"),
+        )
+    };
+    let unit = |name: &str, key: &str, script: &Path| {
+        d.file(
+            &format!("sys/{name}"),
+            &format!(
+                "[Service]\nExecStart=/bin/true\n{key}={}\n",
+                script.display()
+            ),
+        );
+    };
+    let silent = nixos("silent", "set -uo pipefail\nx=$(false)\necho unreachable\n");
+    let two = nixos("two", "# why\nset -u\nset -o pipefail\nfalse\n");
+    let strict = nixos("strict", "set -euo pipefail\nfalse\n");
+    let off = nixos("off", "set +e\nset -uo pipefail\nfalse\n");
+    let later = nixos("later", "set -uo pipefail\ntrue\nset +e\nfalse\n");
+    let long = nixos("long", "set -o errexit -o pipefail\nfalse\n");
+    let bare = nixos("bare", "x=$(false)\necho never\n");
+    // Not one of NixOS's: nobody put a `set -e` in front of it.
+    let own = d.file("scripts/own", "#!/bin/bash\nset -uo pipefail\nfalse\n");
+    unit("silent.service", "ExecStart", &silent);
+    unit("two.service", "ExecStart", &two);
+    unit("pre.service", "ExecStartPre", &silent);
+    unit("stop.service", "ExecStopPost", &silent);
+    unit("strict.service", "ExecStart", &strict);
+    unit("off.service", "ExecStart", &off);
+    unit("later.service", "ExecStart", &later);
+    unit("long.service", "ExecStart", &long);
+    unit("bare.service", "ExecStart", &bare);
+    unit("own.service", "ExecStart", &own);
+    let sys = unit::load("t", &d.0.join("sys"), false).unwrap();
+    let hits: Vec<_> = rules::check(&sys, &["implicit-errexit".into()])
+        .into_iter()
+        .map(|f| f.unit)
+        .collect();
+    assert_eq!(
+        hits,
+        [
+            "pre.service",
+            "silent.service",
+            "stop.service",
+            "two.service"
+        ]
+    );
+}
+
+#[test]
 fn toplevel_with_containers() {
     let d = Dir::new("toplevel");
     d.file("host/etc/systemd/system/a.service", "[Service]\n");
