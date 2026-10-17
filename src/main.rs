@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use unit_lint::config::{self, Config};
 use unit_lint::live::{self, Host, LIVE_RULES, RealHost};
 use unit_lint::rules::{self, RULES};
+use unit_lint::timers::{self, RealTimerHost, TimerHost};
 use unit_lint::unit;
 
 const HELP: &str = "\
@@ -12,6 +13,7 @@ unit-lint — systemd units that are valid and still silently broken
 USAGE:
     unit-lint check [OPTIONS] PATH...
     unit-lint live  [OPTIONS] [--machine NAME]... [--all-machines]
+    unit-lint timers [--textfile PATH] [--host-label NAME] [--machine NAME]... [--all-machines]
     unit-lint rules
 
 check reads unit files before they are deployed. PATH is a NixOS toplevel
@@ -20,6 +22,18 @@ of unit files; write NAME=PATH to name it in the report.
 
 live asks the running system — as root, on the host. --all-machines also
 checks every running container (systemd-nspawn, via machinectl).
+
+timers reads every timer of the host (and, with --machine/--all-machines,
+of its containers) and prints Prometheus metrics: when it last fired, when
+it fires next, its result, and the state of the service it starts. Meant to
+run from a timer of its own, as root, into node_exporter's textfile
+directory. A machine that cannot be read is reported as
+unit_lint_timers_scrape_ok 0, never left out.
+
+TIMERS OPTIONS:
+        --textfile PATH     write the metrics there (temporary file + rename)
+                            instead of stdout
+        --host-label NAME   value of the machine label for the host [host]
 
 OPTIONS:
     -c, --config FILE   exceptions, see README (every one needs a reason)
@@ -31,6 +45,7 @@ OPTIONS:
 
 EXIT STATUS:
     0  clean    1  findings or stale exceptions    2  usage or read error
+    timers: 0  every machine read    1  a machine could not be read    2  usage or write error
 ";
 
 #[derive(Default)]
@@ -43,6 +58,8 @@ struct Args {
     all_machines: bool,
     json: bool,
     verbose: bool,
+    textfile: Option<PathBuf>,
+    host_label: String,
 }
 
 fn parse_args() -> Result<Option<Args>, lexopt::Error> {
@@ -55,6 +72,8 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Short('r') | Long("rule") => a.only.push(p.value()?.string()?),
             Long("machine") => a.machines.push(p.value()?.string()?),
             Long("all-machines") => a.all_machines = true,
+            Long("textfile") => a.textfile = Some(p.value()?.into()),
+            Long("host-label") => a.host_label = p.value()?.string()?,
             Long("json") => a.json = true,
             Short('v') | Long("verbose") => a.verbose = true,
             Short('h') | Long("help") => {
@@ -164,7 +183,7 @@ fn run(a: &Args) -> Result<bool, String> {
                 let rules_run = LIVE_RULES.iter().map(|r| r.0).filter(selected).collect();
                 (findings, rules_run, names, units)
             }
-            "" => return Err("missing command: check, live or rules".into()),
+            "" => return Err("missing command: check, live, timers or rules".into()),
             other => return Err(format!("unknown command {other}")),
         };
 
@@ -187,6 +206,39 @@ fn run(a: &Args) -> Result<bool, String> {
     Ok(!report.failed())
 }
 
+/// `timers`: metrics for every timer of the host and the chosen machines.
+/// Writes what it has even when a machine failed — that machine shows up
+/// as `scrape_ok 0` — and returns false then.
+fn run_timers(a: &Args) -> Result<bool, String> {
+    if !a.paths.is_empty() {
+        return Err(format!("timers takes no PATH (got {})", a.paths.join(" ")));
+    }
+    let host = RealTimerHost;
+    let mut machines = a.machines.clone();
+    if a.all_machines {
+        machines.extend(host.machines()?);
+    }
+    let label = if a.host_label.is_empty() {
+        "host"
+    } else {
+        a.host_label.as_str()
+    };
+    let read = timers::collect_all(&host, label, &machines);
+    let text = timers::render(&read);
+    match &a.textfile {
+        Some(p) => timers::write_textfile(p, &text)?,
+        None => print!("{text}"),
+    }
+    let mut ok = true;
+    for m in &read {
+        if let Err(e) = &m.timers {
+            eprintln!("unit-lint: {}: {e}", m.machine);
+            ok = false;
+        }
+    }
+    Ok(ok)
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(Some(a)) => a,
@@ -200,7 +252,12 @@ fn main() -> ExitCode {
         print_rules();
         return ExitCode::SUCCESS;
     }
-    match run(&args) {
+    let result = if args.command == "timers" {
+        run_timers(&args)
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
         Err(e) => {
