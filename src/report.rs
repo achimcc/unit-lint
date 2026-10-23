@@ -6,6 +6,10 @@ pub struct Finding {
     pub system: String,
     pub unit: String,
     pub message: String,
+    /// `tools` only: the source file the call sites are in, relative to
+    /// `--sources`. An exception may name it to cover just this file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

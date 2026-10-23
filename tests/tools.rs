@@ -94,20 +94,108 @@ fn missing_programs_are_findings_present_ones_are_not() {
             ("ghost-01".to_owned(), "curl".to_owned()),
             ("probe-01".to_owned(), "dirprog".to_owned()),
             ("probe-01".to_owned(), "socat".to_owned()),
+            ("probe-01".to_owned(), "socat".to_owned()),
         ]
     );
     assert!(findings.iter().all(|f| f.rule == tools::TOOL_RULE));
-    let socat = findings.iter().find(|f| f.unit == "socat").unwrap();
+    // One finding per source file, so an exception can name the file.
+    let socat: Vec<_> = findings.iter().filter(|f| f.unit == "socat").collect();
+    assert_eq!(socat.len(), 2);
     assert!(
-        socat.message.contains("a.rs:5") && socat.message.contains("x.md:3"),
-        "{}",
-        socat.message
+        socat
+            .iter()
+            .any(|f| f.file.as_deref() == Some("a.rs") && f.message.contains("a.rs:5"))
     );
-    assert!(socat.message.contains("environment.systemPackages"));
+    assert!(
+        socat.iter().any(
+            |f| f.file.as_deref() == Some("docs/runbooks/x.md") && f.message.contains("x.md:3")
+        )
+    );
+    assert!(socat[0].message.contains("environment.systemPackages"));
     let ghost = findings.iter().find(|f| f.system == "ghost-01").unwrap();
     assert!(
         ghost.message.contains("not a container"),
         "{}",
         ghost.message
     );
+}
+
+// --- the binary -----------------------------------------------------------
+
+fn bin(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_unit-lint"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn out(o: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+/// The self-test fixture, written by the library: one guest `probe-01`
+/// whose profile has `curl` but not `werkzeug-das-es-nicht-gibt`, and a
+/// guest-check module that calls both.
+#[test]
+fn self_test_goes_red_and_reports_it_as_success() {
+    let o = bin(&["tools", "--self-test"]);
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("self-test"), "{}", out(&o));
+}
+
+#[test]
+fn fixture_run_exceptions_and_file_scope() {
+    let d = Dir::new("cli");
+    let (top, sources) = tools::write_self_test_fixture(&d.0).unwrap();
+    let top = top.to_str().unwrap();
+    let sources = sources.to_str().unwrap();
+
+    let o = bin(&["tools", top, "--sources", sources]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        out(&o).contains("probe-01") && out(&o).contains("werkzeug-das-es-nicht-gibt"),
+        "{}",
+        out(&o)
+    );
+
+    let cfg_ok = d.file(
+        "ok.toml",
+        "[[except]]\nrule = \"tool-missing\"\nunit = \"werkzeug-das-es-nicht-gibt\"\nsystem = \"probe-01\"\nfile = \"pkgs/gast-pruefung/src/gaeste/probe_01.rs\"\nreason = \"fixture\"\n",
+    );
+    let o = bin(&[
+        "tools",
+        "--config",
+        cfg_ok.to_str().unwrap(),
+        top,
+        "--sources",
+        sources,
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+
+    let cfg_wrong = d.file(
+        "wrong.toml",
+        "[[except]]\nrule = \"tool-missing\"\nunit = \"werkzeug-das-es-nicht-gibt\"\nsystem = \"probe-01\"\nfile = \"docs/runbooks/other.md\"\nreason = \"fixture\"\n",
+    );
+    let o = bin(&[
+        "tools",
+        "--config",
+        cfg_wrong.to_str().unwrap(),
+        top,
+        "--sources",
+        sources,
+    ]);
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(out(&o).contains("stale exception"), "{}", out(&o));
+
+    let empty = d.dir("empty-sources");
+    let o = bin(&["tools", top, "--sources", empty.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2), "{}", out(&o));
+    assert!(out(&o).contains("no call sites"), "{}", out(&o));
+
+    let o = bin(&["tools", "--json", top, "--sources", sources]);
+    assert!(out(&o).contains("\"file\""), "{}", out(&o));
 }

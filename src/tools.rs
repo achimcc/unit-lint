@@ -132,6 +132,12 @@ fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Paths in findings and exceptions are relative to the sources root.
+fn relative(root: &Path, file: &Path) -> PathBuf {
+    file.strip_prefix(root)
+        .map_or_else(|_| file.to_path_buf(), Path::to_path_buf)
+}
+
 fn guest_from_module(root: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(root.join(RUST_ROOT)).ok()?;
     let first = rel.components().next()?.as_os_str().to_str()?;
@@ -163,7 +169,7 @@ fn scan_rust(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
                     CallSite {
                         machine,
                         program: program.to_owned(),
-                        file: file.clone(),
+                        file: relative(root, &file),
                         line: line_of(&text, start),
                     },
                 ));
@@ -195,7 +201,7 @@ fn scan_markdown(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
                 out.push(CallSite {
                     machine: c[1].to_owned(),
                     program: program.to_owned(),
-                    file: file.clone(),
+                    file: relative(root, &file),
                     line: i + 1,
                 });
             }
@@ -237,17 +243,20 @@ fn places(sites: &[&CallSite]) -> String {
 pub fn check(top: &Path, sites: &[CallSite]) -> std::io::Result<(Vec<Finding>, Vec<String>)> {
     let guests = unit::container_paths(top)?;
     let names: Vec<String> = guests.iter().map(|(n, _)| n.clone()).collect();
-    // Group by (machine, program), keeping first-seen order.
-    let mut groups: Vec<((String, String), Vec<&CallSite>)> = Vec::new();
+    // Group by (machine, program, file), keeping first-seen order: one
+    // finding per file, so an exception can name the file it covers.
+    type Key = (String, String, PathBuf);
+    let mut groups: Vec<(Key, Vec<&CallSite>)> = Vec::new();
     for s in sites {
-        let key = (s.machine.clone(), s.program.clone());
+        let key = (s.machine.clone(), s.program.clone(), s.file.clone());
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(s),
             None => groups.push((key, vec![s])),
         }
     }
     let mut findings = Vec::new();
-    for ((machine, program), group) in groups {
+    for ((machine, program, file), group) in groups {
+        let file = Some(file.display().to_string());
         let Some((_, sp)) = guests.iter().find(|(n, _)| *n == machine) else {
             findings.push(Finding {
                 rule: TOOL_RULE,
@@ -257,6 +266,7 @@ pub fn check(top: &Path, sites: &[CallSite]) -> std::io::Result<(Vec<Finding>, V
                     "{program} is called from {} for machine {machine}, which is not a container of this toplevel",
                     places(&group)
                 ),
+                file,
             });
             continue;
         };
@@ -271,9 +281,71 @@ pub fn check(top: &Path, sites: &[CallSite]) -> std::io::Result<(Vec<Finding>, V
                 "{program} is called from {} but is not in the system profile of {machine} (environment.systemPackages)",
                 places(&group)
             ),
+            file,
         });
     }
     Ok((findings, names))
+}
+
+/// The program the self-test fixture calls and does not have.
+pub const SELF_TEST_PROGRAM: &str = "werkzeug-das-es-nicht-gibt";
+pub const SELF_TEST_GUEST: &str = "probe-01";
+
+/// Writes the self-test fixture under `dir`: a toplevel with one guest
+/// whose profile has `curl`, and a sources tree whose guest-check module
+/// calls `curl` and [`SELF_TEST_PROGRAM`]. Returns `(toplevel, sources)`.
+pub fn write_self_test_fixture(dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    let top = dir.join("toplevel");
+    let guest = dir.join("guest-system");
+    let sources = dir.join("sources");
+    std::fs::create_dir_all(top.join("etc/systemd/system"))?;
+    std::fs::create_dir_all(top.join("etc/nixos-containers"))?;
+    std::fs::create_dir_all(guest.join("etc/systemd/system"))?;
+    std::fs::create_dir_all(guest.join("sw/bin"))?;
+    std::fs::write(guest.join("sw/bin/curl"), "#!/bin/sh\n")?;
+    std::fs::write(
+        top.join(format!("etc/nixos-containers/{SELF_TEST_GUEST}.conf")),
+        format!("PRIVATE_NETWORK=1\nSYSTEM_PATH=\"{}\"\n", guest.display()),
+    )?;
+    let module = sources.join(RUST_ROOT).join("probe_01.rs");
+    std::fs::create_dir_all(module.parent().unwrap())?;
+    std::fs::write(
+        &module,
+        format!(
+            "const GAST: &str = \"{SELF_TEST_GUEST}\";\nfn probe(a: &dyn Ausfuehrer) {{\n    a.gast(GAST, \"curl\", &[\"-sS\", \"http://127.0.0.1/\"], None);\n    a.gast(GAST, \"{SELF_TEST_PROGRAM}\", &[], None);\n}}\n"
+        ),
+    )?;
+    Ok((top, sources))
+}
+
+/// Runs the scan and the check over the fixture and demands exactly the one
+/// finding it plants. A scanner that cannot go red is not a check.
+pub fn self_test() -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("unit-lint-self-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let result = (|| {
+        let (top, sources) = write_self_test_fixture(&dir).map_err(|e| e.to_string())?;
+        let sites = scan_sources(&sources, true).map_err(|e| e.to_string())?;
+        let (findings, _) = check(&top, &sites).map_err(|e| e.to_string())?;
+        let planted = findings
+            .iter()
+            .filter(|f| f.system == SELF_TEST_GUEST && f.unit == SELF_TEST_PROGRAM)
+            .count();
+        if sites.len() == 2 && findings.len() == 1 && planted == 1 {
+            Ok(format!(
+                "self-test: {} call sites, 1 finding ({SELF_TEST_GUEST} lacks {SELF_TEST_PROGRAM}) — the scan goes red",
+                sites.len()
+            ))
+        } else {
+            Err(format!(
+                "self-test: the scan did not go red as planted ({} call sites, {} findings)",
+                sites.len(),
+                findings.len()
+            ))
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 #[cfg(test)]

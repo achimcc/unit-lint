@@ -107,6 +107,7 @@ fn finding(sys: &System, unit: &str, rule: &'static str, message: String) -> Fin
         system: sys.name.clone(),
         unit: unit.to_owned(),
         message,
+        file: None,
     }
 }
 

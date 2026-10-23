@@ -5,6 +5,7 @@ use unit_lint::config::{self, Config};
 use unit_lint::live::{self, Host, LIVE_RULES, RealHost};
 use unit_lint::rules::{self, RULES};
 use unit_lint::timers::{self, RealTimerHost, TimerHost};
+use unit_lint::tools;
 use unit_lint::unit;
 
 const HELP: &str = "\
@@ -14,6 +15,8 @@ USAGE:
     unit-lint check [OPTIONS] PATH...
     unit-lint live  [OPTIONS] [--machine NAME]... [--all-machines]
     unit-lint timers [--textfile PATH] [--host-label NAME] [--machine NAME]... [--all-machines]
+    unit-lint tools  [OPTIONS] [--rust-only] TOPLEVEL --sources DIR...
+    unit-lint tools  --self-test
     unit-lint rules
 
 check reads unit files before they are deployed. PATH is a NixOS toplevel
@@ -29,6 +32,25 @@ it fires next, its result, and the state of the service it starts. Meant to
 run from a timer of its own, as root, into node_exporter's textfile
 directory. A machine that cannot be read is reported as
 unit_lint_timers_scrape_ok 0, never left out.
+
+tools asks whether every program that our own sources start in a guest
+over the PATH is in that guest's system profile (`<SYSTEM_PATH>/sw/bin`,
+i.e. environment.systemPackages). A unit's ExecStart carries the store path
+and runs regardless; a hand or the guest check gets 203/EXEC. Call sites
+are read from the guest check's modules under
+pkgs/gast-pruefung/src/gaeste/ (`a.gast(GAST, <prog>, …)`, `a.gast_mit`,
+`a.als`; the guest is the module, or a literal in the call) and from the
+living Markdown (README.md, CLAUDE.md, docs/runbooks, docs/werkzeuge,
+.claude/skills, .claude/agents: `vantage run <guest> … -- prog`). Line
+comments, store paths and shell builtins are skipped. Zero call sites is an
+error, not a clean run. Exceptions use rule `tool-missing`, `unit` = the
+program, and may name `file` to cover one source file only.
+
+TOOLS OPTIONS:
+        --sources DIR       the source tree to scan; repeatable
+        --rust-only         skip the Markdown
+        --self-test         run the scan over a built-in fixture that must
+                            go red, and nothing else
 
 TIMERS OPTIONS:
         --textfile PATH     write the metrics there (temporary file + rename)
@@ -46,6 +68,7 @@ OPTIONS:
 EXIT STATUS:
     0  clean    1  findings or stale exceptions    2  usage or read error
     timers: 0  every machine read    1  a machine could not be read    2  usage or write error
+    tools:  2 also when no call site was found, or the self-test did not go red
 ";
 
 #[derive(Default)]
@@ -60,6 +83,9 @@ struct Args {
     verbose: bool,
     textfile: Option<PathBuf>,
     host_label: String,
+    sources: Vec<PathBuf>,
+    rust_only: bool,
+    self_test: bool,
 }
 
 fn parse_args() -> Result<Option<Args>, lexopt::Error> {
@@ -74,6 +100,9 @@ fn parse_args() -> Result<Option<Args>, lexopt::Error> {
             Long("all-machines") => a.all_machines = true,
             Long("textfile") => a.textfile = Some(p.value()?.into()),
             Long("host-label") => a.host_label = p.value()?.string()?,
+            Long("sources") => a.sources.push(p.value()?.into()),
+            Long("rust-only") => a.rust_only = true,
+            Long("self-test") => a.self_test = true,
             Long("json") => a.json = true,
             Short('v') | Long("verbose") => a.verbose = true,
             Short('h') | Long("help") => {
@@ -111,6 +140,11 @@ fn print_rules() {
     for (id, summary, explain) in LIVE_RULES {
         println!("{id}\n  {summary}\n  {explain}\n");
     }
+    println!("tools (sources against the built guests):\n");
+    println!(
+        "{}\n  a program our sources start in a guest over the PATH is not in that guest's profile\n  ExecStart carries the store path, a hand or the guest check gets 203/EXEC — add it to environment.systemPackages\n",
+        tools::TOOL_RULE
+    );
 }
 
 fn run(a: &Args) -> Result<bool, String> {
@@ -119,6 +153,7 @@ fn run(a: &Args) -> Result<bool, String> {
         .iter()
         .map(|r| r.id)
         .chain(LIVE_RULES.iter().map(|r| r.0))
+        .chain(std::iter::once(tools::TOOL_RULE))
         .collect();
     if let Some(bad) = a.only.iter().find(|o| !known.contains(&o.as_str())) {
         return Err(format!("unknown rule {bad} — see `unit-lint rules`"));
@@ -183,7 +218,48 @@ fn run(a: &Args) -> Result<bool, String> {
                 let rules_run = LIVE_RULES.iter().map(|r| r.0).filter(selected).collect();
                 (findings, rules_run, names, units)
             }
-            "" => return Err("missing command: check, live, timers or rules".into()),
+            "tools" => {
+                let top = match a.paths.as_slice() {
+                    [one] => PathBuf::from(one),
+                    [] => return Err("tools needs a TOPLEVEL (or --self-test)".into()),
+                    more => return Err(format!("tools takes one TOPLEVEL, got {}", more.len())),
+                };
+                if a.sources.is_empty() {
+                    return Err("tools needs --sources DIR".into());
+                }
+                let mut sites = Vec::new();
+                for root in &a.sources {
+                    sites.extend(
+                        tools::scan_sources(root, a.rust_only)
+                            .map_err(|e| format!("{}: {e}", root.display()))?,
+                    );
+                }
+                if sites.is_empty() {
+                    return Err(format!(
+                        "no call sites found under --sources {} — wrong directory?",
+                        a.sources
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                let (findings, guests) =
+                    tools::check(&top, &sites).map_err(|e| format!("{}: {e}", top.display()))?;
+                eprintln!(
+                    "unit-lint tools: {} call sites, {} guests",
+                    sites.len(),
+                    guests.len()
+                );
+                let findings = findings.into_iter().filter(|f| selected(&f.rule)).collect();
+                let rules_run = [tools::TOOL_RULE]
+                    .iter()
+                    .copied()
+                    .filter(selected)
+                    .collect();
+                (findings, rules_run, guests, sites.len())
+            }
+            "" => return Err("missing command: check, live, timers, tools or rules".into()),
             other => return Err(format!("unknown command {other}")),
         };
 
@@ -251,6 +327,18 @@ fn main() -> ExitCode {
     if args.command == "rules" {
         print_rules();
         return ExitCode::SUCCESS;
+    }
+    if args.command == "tools" && args.self_test {
+        return match tools::self_test() {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("unit-lint: {e}");
+                ExitCode::from(2)
+            }
+        };
     }
     let result = if args.command == "timers" {
         run_timers(&args)

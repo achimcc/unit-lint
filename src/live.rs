@@ -145,6 +145,7 @@ pub fn check_system(
         system: system.clone(),
         unit: unit.to_owned(),
         message,
+        file: None,
     };
     for u in &units {
         let get = |k: &str| u.get(k).map(String::as_str).unwrap_or("");

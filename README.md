@@ -25,6 +25,48 @@ unit-lint: 34 system(s), 6886 unit(s)
 A NixOS toplevel brings its declarative containers along
 (`etc/nixos-containers/*.conf`); they are checked as systems of their own.
 
+## tools: is every program a hand starts in a guest in that guest's profile?
+
+Since 0.4.0. A unit's `ExecStart` carries the store path, so the unit runs
+whether or not the program is in `environment.systemPackages`. A hand
+(`vantage run guest -- prog`, a runbook) and the guest check
+(`systemd-run --machine=guest … prog`) go through the guest's PATH and get
+`203/EXEC` instead — the most frequent trap in the homelab this tool comes
+from (70 hits in six weeks). `unit-lint tools` reads the call sites from our
+own sources and checks each against `<SYSTEM_PATH>/sw/bin` of the built
+guest:
+
+```console
+$ unit-lint tools --config unit-lint.toml result --sources .
+unit-lint tools: 241 call sites, 43 guests
+unit-lint: 43 system(s), 241 unit(s)
+  media-01  socat  [tool-missing] socat is called from pkgs/gast-pruefung/src/gaeste/media_01/sab.rs:88 but is not in the system profile of media-01 (environment.systemPackages)
+1 finding(s), 0 stale exception(s), 0 excepted — `unit-lint rules` explains each rule
+```
+
+Call sites: `a.gast(GAST, "prog", …)`, `a.gast_mit(GAST, &[…], "prog", …)` and
+`a.als(GAST, user, group, "prog", …)` under `pkgs/gast-pruefung/src/gaeste/`
+(the guest is the module directory, or a literal first argument), and
+`vantage run <guest> … -- prog` lines in the living Markdown (`README.md`,
+`CLAUDE.md`, `docs/runbooks`, `docs/werkzeuge`, `.claude/skills`,
+`.claude/agents`). Line comments, absolute paths and shell builtins are
+skipped. In the report the program stands where a unit name would. One
+finding per source file, so an exception can be scoped:
+
+```toml
+[[except]]
+rule = "tool-missing"
+unit = "logcli"
+system = "obs-01"
+file = "docs/runbooks/loki.md"     # optional: this file only
+reason = "the runbook runs it from the workstation over ssh, not in the guest"
+```
+
+Zero call sites is exit 2, not a clean run — a scanner pointed at the wrong
+directory must not pass. `unit-lint tools --self-test` writes a built-in
+fixture (one guest, one missing program) and demands that the scan goes red;
+run it before the real scan in CI.
+
 ## Rules
 
 `unit-lint rules` prints each with its explanation.

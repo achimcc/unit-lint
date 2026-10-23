@@ -28,6 +28,10 @@ pub struct Exception {
     pub rule: String,
     pub unit: String,
     pub system: Option<String>,
+    /// `tool-missing` only: cover the finding only when its call sites are
+    /// in this file (relative to `--sources`). Without it, an exception for a
+    /// runbook would also hide a later real call in the guest check.
+    pub file: Option<String>,
     pub reason: String,
 }
 
@@ -35,6 +39,10 @@ impl Exception {
     fn matches(&self, f: &Finding) -> bool {
         self.rule == f.rule
             && self.system.as_ref().is_none_or(|s| *s == f.system)
+            && self
+                .file
+                .as_ref()
+                .is_none_or(|x| f.file.as_deref() == Some(x.as_str()))
             && match self.unit.strip_suffix('*') {
                 Some(prefix) => f.unit.starts_with(prefix),
                 None => self.unit == f.unit,
@@ -43,12 +51,16 @@ impl Exception {
 
     fn describe(&self) -> String {
         format!(
-            "[{}] {}{}",
+            "[{}] {}{}{}",
             self.rule,
             self.unit,
             self.system
                 .as_deref()
                 .map(|s| format!(" in {s}"))
+                .unwrap_or_default(),
+            self.file
+                .as_deref()
+                .map(|s| format!(" from {s}"))
                 .unwrap_or_default()
         )
     }
@@ -117,6 +129,7 @@ mod tests {
             system: system.into(),
             unit: unit.into(),
             message: String::new(),
+            file: None,
         }
     }
 
