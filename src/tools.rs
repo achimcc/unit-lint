@@ -291,9 +291,51 @@ pub fn check(top: &Path, sites: &[CallSite]) -> std::io::Result<(Vec<Finding>, V
 pub const SELF_TEST_PROGRAM: &str = "werkzeug-das-es-nicht-gibt";
 pub const SELF_TEST_GUEST: &str = "probe-01";
 
+/// A file that must not exist yet: an existing path — or a symlink planted
+/// there — is an error, never followed or overwritten.
+fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(text.as_bytes())
+}
+
+/// A fresh directory under the temp dir with mode 0700 and a name nobody
+/// can predict well enough to plant: created with `create_dir`, which fails
+/// when the path exists, so a prepared symlink is refused, not followed.
+pub fn fresh_private_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let base = std::env::temp_dir();
+    for attempt in 0..64u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let addr = &attempt as *const u32 as usize;
+        let name = format!(
+            "{prefix}-{}-{:08x}{:x}",
+            std::process::id(),
+            nanos ^ (addr as u32).rotate_left(attempt % 32),
+            attempt
+        );
+        let p = base.join(name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+            Ok(()) => return Ok(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(
+        "no fresh temp directory after 64 attempts",
+    ))
+}
+
 /// Writes the self-test fixture under `dir`: a toplevel with one guest
 /// whose profile has `curl`, and a sources tree whose guest-check module
 /// calls `curl` and [`SELF_TEST_PROGRAM`]. Returns `(toplevel, sources)`.
+/// Every file is created new; whatever already exists under `dir` makes
+/// this fail.
 pub fn write_self_test_fixture(dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let top = dir.join("toplevel");
     let guest = dir.join("guest-system");
@@ -302,16 +344,16 @@ pub fn write_self_test_fixture(dir: &Path) -> std::io::Result<(PathBuf, PathBuf)
     std::fs::create_dir_all(top.join("etc/nixos-containers"))?;
     std::fs::create_dir_all(guest.join("etc/systemd/system"))?;
     std::fs::create_dir_all(guest.join("sw/bin"))?;
-    std::fs::write(guest.join("sw/bin/curl"), "#!/bin/sh\n")?;
-    std::fs::write(
-        top.join(format!("etc/nixos-containers/{SELF_TEST_GUEST}.conf")),
-        format!("PRIVATE_NETWORK=1\nSYSTEM_PATH=\"{}\"\n", guest.display()),
+    write_new(&guest.join("sw/bin/curl"), "#!/bin/sh\n")?;
+    write_new(
+        &top.join(format!("etc/nixos-containers/{SELF_TEST_GUEST}.conf")),
+        &format!("PRIVATE_NETWORK=1\nSYSTEM_PATH=\"{}\"\n", guest.display()),
     )?;
     let module = sources.join(RUST_ROOT).join("probe_01.rs");
     std::fs::create_dir_all(module.parent().unwrap())?;
-    std::fs::write(
+    write_new(
         &module,
-        format!(
+        &format!(
             "const GAST: &str = \"{SELF_TEST_GUEST}\";\nfn probe(a: &dyn Ausfuehrer) {{\n    a.gast(GAST, \"curl\", &[\"-sS\", \"http://127.0.0.1/\"], None);\n    a.gast(GAST, \"{SELF_TEST_PROGRAM}\", &[], None);\n}}\n"
         ),
     )?;
@@ -321,8 +363,7 @@ pub fn write_self_test_fixture(dir: &Path) -> std::io::Result<(PathBuf, PathBuf)
 /// Runs the scan and the check over the fixture and demands exactly the one
 /// finding it plants. A scanner that cannot go red is not a check.
 pub fn self_test() -> Result<String, String> {
-    let dir = std::env::temp_dir().join(format!("unit-lint-self-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = fresh_private_dir("unit-lint-self-test").map_err(|e| e.to_string())?;
     let result = (|| {
         let (top, sources) = write_self_test_fixture(&dir).map_err(|e| e.to_string())?;
         let sites = scan_sources(&sources, true).map_err(|e| e.to_string())?;

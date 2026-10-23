@@ -199,3 +199,30 @@ fn fixture_run_exceptions_and_file_scope() {
     let o = bin(&["tools", "--json", top, "--sources", sources]);
     assert!(out(&o).contains("\"file\""), "{}", out(&o));
 }
+
+/// The fixture never follows what is already there: a file in the way makes
+/// it fail instead of being overwritten (or, as a symlink, followed).
+#[test]
+fn fixture_refuses_to_overwrite_existing_files() {
+    let d = Dir::new("noclobber");
+    d.file("guest-system/sw/bin/curl", "planted\n");
+    let r = tools::write_self_test_fixture(&d.0);
+    assert!(r.is_err(), "fixture overwrote an existing file");
+    assert_eq!(
+        fs::read_to_string(d.0.join("guest-system/sw/bin/curl")).unwrap(),
+        "planted\n"
+    );
+}
+
+/// The self-test's own directory is fresh and private, never a reused path.
+#[test]
+fn self_test_dir_is_private_and_fresh() {
+    let dir = tools::fresh_private_dir("unit-lint-test").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "{mode:o}");
+    let again = tools::fresh_private_dir("unit-lint-test").unwrap();
+    assert_ne!(dir, again);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&again);
+}
