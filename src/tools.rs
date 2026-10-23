@@ -11,6 +11,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::report::Finding;
+use crate::unit;
+
 /// One place in our sources that starts `program` in `machine` over the PATH.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallSite {
@@ -210,6 +213,67 @@ pub fn scan_sources(root: &Path, rust_only: bool) -> std::io::Result<Vec<CallSit
         scan_markdown(root, &mut out)?;
     }
     Ok(out)
+}
+
+/// The rule id of every finding `tools` produces.
+pub const TOOL_RULE: &str = "tool-missing";
+
+fn present(profile_bin: &Path, program: &str) -> bool {
+    std::fs::symlink_metadata(profile_bin.join(program)).is_ok_and(|m| !m.is_dir())
+}
+
+fn places(sites: &[&CallSite]) -> String {
+    sites
+        .iter()
+        .map(|s| format!("{}:{}", s.file.display(), s.line))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Checks every call site against the guest it names. Returns the findings
+/// and the names of the guests the toplevel has (for the staleness check of
+/// exceptions). Several sites of one `(guest, program)` pair fold into one
+/// finding that lists them all.
+pub fn check(top: &Path, sites: &[CallSite]) -> std::io::Result<(Vec<Finding>, Vec<String>)> {
+    let guests = unit::container_paths(top)?;
+    let names: Vec<String> = guests.iter().map(|(n, _)| n.clone()).collect();
+    // Group by (machine, program), keeping first-seen order.
+    let mut groups: Vec<((String, String), Vec<&CallSite>)> = Vec::new();
+    for s in sites {
+        let key = (s.machine.clone(), s.program.clone());
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(s),
+            None => groups.push((key, vec![s])),
+        }
+    }
+    let mut findings = Vec::new();
+    for ((machine, program), group) in groups {
+        let Some((_, sp)) = guests.iter().find(|(n, _)| *n == machine) else {
+            findings.push(Finding {
+                rule: TOOL_RULE,
+                system: machine.clone(),
+                unit: program.clone(),
+                message: format!(
+                    "{program} is called from {} for machine {machine}, which is not a container of this toplevel",
+                    places(&group)
+                ),
+            });
+            continue;
+        };
+        if present(&sp.join("sw/bin"), &program) {
+            continue;
+        }
+        findings.push(Finding {
+            rule: TOOL_RULE,
+            system: machine.clone(),
+            unit: program.clone(),
+            message: format!(
+                "{program} is called from {} but is not in the system profile of {machine} (environment.systemPackages)",
+                places(&group)
+            ),
+        });
+    }
+    Ok((findings, names))
 }
 
 #[cfg(test)]

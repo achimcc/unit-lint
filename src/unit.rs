@@ -256,27 +256,39 @@ pub fn load(name: &str, dir: &Path, container: bool) -> std::io::Result<System> 
 /// `etc/nixos-containers/<name>.conf` names the container's own toplevel.
 pub fn load_toplevel(label: &str, top: &Path) -> std::io::Result<Vec<System>> {
     let mut out = vec![load_one_toplevel(label, top, false)?];
+    for (name, sp) in container_paths(top)? {
+        out.push(load_one_toplevel(&name, &sp, true)?);
+    }
+    Ok(out)
+}
+
+/// The containers of a toplevel with their own toplevels, in name order:
+/// `etc/nixos-containers/<name>.conf` → `SYSTEM_PATH`. A conf without a
+/// readable system path is an error, not a missing container.
+pub fn container_paths(top: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
     let confs = top.join("etc/nixos-containers");
-    if confs.is_dir() {
-        for (f, p) in sorted_dir(&confs)? {
-            let Some(name) = f.strip_suffix(".conf") else {
-                continue;
-            };
-            let text = fs::read_to_string(&p)?;
-            let sp = text
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("SYSTEM_PATH="))
-                .map(|s| s.trim_matches('"'));
-            match sp {
-                Some(sp) if Path::new(sp).join("etc/systemd/system").is_dir() => {
-                    out.push(load_one_toplevel(name, Path::new(sp), true)?);
-                }
-                _ => {
-                    return Err(std::io::Error::other(format!(
-                        "container {name}: no readable SYSTEM_PATH in {} (is the toplevel fully built?)",
-                        p.display()
-                    )));
-                }
+    if !confs.is_dir() {
+        return Ok(out);
+    }
+    for (f, p) in sorted_dir(&confs)? {
+        let Some(name) = f.strip_suffix(".conf") else {
+            continue;
+        };
+        let text = fs::read_to_string(&p)?;
+        let sp = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("SYSTEM_PATH="))
+            .map(|s| s.trim_matches('"'));
+        match sp {
+            Some(sp) if Path::new(sp).join("etc/systemd/system").is_dir() => {
+                out.push((name.to_owned(), PathBuf::from(sp)));
+            }
+            _ => {
+                return Err(std::io::Error::other(format!(
+                    "container {name}: no readable SYSTEM_PATH in {} (is the toplevel fully built?)",
+                    p.display()
+                )));
             }
         }
     }
