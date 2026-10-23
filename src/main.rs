@@ -42,9 +42,12 @@ pkgs/gast-pruefung/src/gaeste/ (`a.gast(GAST, <prog>, …)`, `a.gast_mit`,
 `a.als`; the guest is the module, or a literal in the call) and from the
 living Markdown (README.md, CLAUDE.md, docs/runbooks, docs/werkzeuge,
 .claude/skills, .claude/agents: `vantage run <guest> … -- prog`). Line
-comments, store paths and shell builtins are skipped. Zero call sites is an
-error, not a clean run. Exceptions use rule `tool-missing`, `unit` = the
-program, and may name `file` to cover one source file only.
+comments, store paths and shell builtins are skipped. A call whose program
+(or an argument before it) is not a literal cannot be read; it is reported
+as `tool-unparsed` (unit = file:line) rather than skipped. Zero call sites
+is an error, not a clean run. Exceptions use rule `tool-missing`, `unit` =
+the program (or `tool-unparsed`, `unit` = file:line), and may name `file`
+to cover one source file only.
 
 TOOLS OPTIONS:
         --sources DIR       the source tree to scan; repeatable
@@ -145,6 +148,10 @@ fn print_rules() {
         "{}\n  a program our sources start in a guest over the PATH is not in that guest's profile\n  ExecStart carries the store path, a hand or the guest check gets 203/EXEC — add it to environment.systemPackages\n",
         tools::TOOL_RULE
     );
+    println!(
+        "{}\n  a call of a.gast/a.gast_mit/a.als the scanner could not read (program or an argument before it is not a literal)\n  a silent gap is what this check exists to prevent: name the program as a literal, or except the call with a reason\n",
+        tools::UNPARSED_RULE
+    );
 }
 
 fn run(a: &Args) -> Result<bool, String> {
@@ -153,7 +160,7 @@ fn run(a: &Args) -> Result<bool, String> {
         .iter()
         .map(|r| r.id)
         .chain(LIVE_RULES.iter().map(|r| r.0))
-        .chain(std::iter::once(tools::TOOL_RULE))
+        .chain([tools::TOOL_RULE, tools::UNPARSED_RULE])
         .collect();
     if let Some(bad) = a.only.iter().find(|o| !known.contains(&o.as_str())) {
         return Err(format!("unknown rule {bad} — see `unit-lint rules`"));
@@ -228,11 +235,12 @@ fn run(a: &Args) -> Result<bool, String> {
                     return Err("tools needs --sources DIR".into());
                 }
                 let mut sites = Vec::new();
+                let mut unparsed = Vec::new();
                 for root in &a.sources {
-                    sites.extend(
-                        tools::scan_sources(root, a.rust_only)
-                            .map_err(|e| format!("{}: {e}", root.display()))?,
-                    );
+                    let scan = tools::scan_all(root, a.rust_only)
+                        .map_err(|e| format!("{}: {e}", root.display()))?;
+                    sites.extend(scan.sites);
+                    unparsed.extend(scan.unparsed);
                 }
                 if sites.is_empty() {
                     return Err(format!(
@@ -244,15 +252,17 @@ fn run(a: &Args) -> Result<bool, String> {
                             .join(", ")
                     ));
                 }
-                let (findings, guests) =
+                let (mut findings, guests) =
                     tools::check(&top, &sites).map_err(|e| format!("{}: {e}", top.display()))?;
                 eprintln!(
-                    "unit-lint tools: {} call sites, {} guests",
+                    "unit-lint tools: {} call sites, {} unparsed, {} guests",
                     sites.len(),
+                    unparsed.len(),
                     guests.len()
                 );
+                findings.extend(tools::unparsed_findings(&unparsed));
                 let findings = findings.into_iter().filter(|f| selected(&f.rule)).collect();
-                let rules_run = [tools::TOOL_RULE]
+                let rules_run = [tools::TOOL_RULE, tools::UNPARSED_RULE]
                     .iter()
                     .copied()
                     .filter(selected)

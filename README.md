@@ -38,8 +38,8 @@ guest:
 
 ```console
 $ unit-lint tools --config unit-lint.toml result --sources .
-unit-lint tools: 241 call sites, 43 guests
-unit-lint: 43 system(s), 241 unit(s)
+unit-lint tools: 155 call sites, 4 unparsed, 43 guests
+unit-lint: 43 system(s), 155 unit(s)
   media-01  socat  [tool-missing] socat is called from pkgs/gast-pruefung/src/gaeste/media_01/sab.rs:88 but is not in the system profile of media-01 (environment.systemPackages)
 1 finding(s), 0 stale exception(s), 0 excepted — `unit-lint rules` explains each rule
 ```
@@ -50,8 +50,12 @@ Call sites: `a.gast(GAST, "prog", …)`, `a.gast_mit(GAST, &[…], "prog", …)`
 `vantage run <guest> … -- prog` lines in the living Markdown (`README.md`,
 `CLAUDE.md`, `docs/runbooks`, `docs/werkzeuge`, `.claude/skills`,
 `.claude/agents`). Line comments, absolute paths and shell builtins are
-skipped. In the report the program stands where a unit name would. One
-finding per source file, so an exception can be scoped:
+skipped. A call whose program — or an argument before it — is an
+identifier rather than a literal cannot be read; since 0.4.2 it is reported
+as `tool-unparsed` (unit = `file:line`) instead of being skipped, because a
+silent gap is the one thing this check must not have. In the report the
+program stands where a unit name would. One finding per source file, so an
+exception can be scoped:
 
 ```toml
 [[except]]

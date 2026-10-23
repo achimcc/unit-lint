@@ -42,6 +42,9 @@ const MARKDOWN_DIRS: &[&str] = &[
 
 static RUST_CALLS: LazyLock<[(Regex, usize); 3]> = LazyLock::new(|| {
     let guest = r#"(?:"([a-z0-9-]+)"|[A-Za-z_][A-Za-z0-9_]*)"#;
+    // A string literal, a slice literal or an identifier: user, group,
+    // properties (review 2026-10-23: `a.als(GAST, nutzer, "media", "touch", …)`).
+    let arg = r#"(?:"[^"]*"|&?\[[^\]]*\]|&?[A-Za-z_][A-Za-z0-9_.]*)"#;
     [
         // a.gast(GAST, "prog", …) — program is the second argument.
         (
@@ -51,21 +54,45 @@ static RUST_CALLS: LazyLock<[(Regex, usize); 3]> = LazyLock::new(|| {
         // a.gast_mit(GAST, &[…], "prog", …) — third.
         (
             Regex::new(&format!(
-                r#"(?s)\ba\.gast_mit\(\s*{guest}\s*,\s*&\[[^\]]*\]\s*,\s*"([^"]+)""#
+                r#"(?s)\ba\.gast_mit\(\s*{guest}\s*,\s*{arg}\s*,\s*"([^"]+)""#
             ))
             .unwrap(),
             2,
         ),
-        // a.als(GAST, "user", "group", "prog", …) — fourth.
+        // a.als(GAST, user, group, "prog", …) — fourth.
         (
             Regex::new(&format!(
-                r#"(?s)\ba\.als\(\s*{guest}\s*,\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]+)""#
+                r#"(?s)\ba\.als\(\s*{guest}\s*,\s*{arg}\s*,\s*{arg}\s*,\s*"([^"]+)""#
             ))
             .unwrap(),
             2,
         ),
     ]
 });
+
+/// Every call of the three methods, matched or not — the net under the
+/// regexes: a call the regexes could not read is reported, never skipped.
+static ANY_CALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\ba\.(?:gast|gast_mit|als)\(").unwrap());
+
+/// A call site the scanner found but could not read: the program (or an
+/// argument before it) is not a literal. Reported as `tool-unparsed`, so
+/// it takes an exception with a reason — a silent gap is what this tool
+/// exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unparsed {
+    pub machine: String,
+    pub file: PathBuf,
+    pub line: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub sites: Vec<CallSite>,
+    pub unparsed: Vec<Unparsed>,
+}
+
+pub const UNPARSED_RULE: &str = "tool-unparsed";
 
 static VANTAGE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"vantage run ([a-z0-9]+-[0-9]{2})\b[^\n]*?\s--\s+([^\s'"`]+)"#).unwrap()
@@ -145,7 +172,7 @@ fn guest_from_module(root: &Path, file: &Path) -> Option<String> {
     Some(name.replace('_', "-"))
 }
 
-fn scan_rust(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
+fn scan_rust(root: &Path, out: &mut Scan) -> std::io::Result<()> {
     let mut files = Vec::new();
     walk(&root.join(RUST_ROOT), "rs", &mut files)?;
     for file in files {
@@ -154,8 +181,11 @@ fn scan_rust(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
         };
         let text = strip_line_comments(&std::fs::read_to_string(&file)?);
         let mut found: Vec<(usize, CallSite)> = Vec::new();
+        let mut matched_starts: Vec<usize> = Vec::new();
         for (re, prog_group) in RUST_CALLS.iter() {
             for c in re.captures_iter(&text) {
+                let start = c.get(0).unwrap().start();
+                matched_starts.push(start);
                 let program = &c[*prog_group];
                 if !wanted(program) {
                     continue;
@@ -163,7 +193,6 @@ fn scan_rust(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
                 let machine = c
                     .get(1)
                     .map_or_else(|| module_guest.clone(), |m| m.as_str().to_owned());
-                let start = c.get(0).unwrap().start();
                 found.push((
                     start,
                     CallSite {
@@ -175,8 +204,17 @@ fn scan_rust(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
                 ));
             }
         }
+        for m in ANY_CALL.find_iter(&text) {
+            if !matched_starts.contains(&m.start()) {
+                out.unparsed.push(Unparsed {
+                    machine: module_guest.clone(),
+                    file: relative(root, &file),
+                    line: line_of(&text, m.start()),
+                });
+            }
+        }
         found.sort_by_key(|(start, _)| *start);
-        out.extend(found.into_iter().map(|(_, s)| s));
+        out.sites.extend(found.into_iter().map(|(_, s)| s));
     }
     Ok(())
 }
@@ -212,13 +250,32 @@ fn scan_markdown(root: &Path, out: &mut Vec<CallSite>) -> std::io::Result<()> {
 
 /// Every call site under `root`: the guest check's modules, and — unless
 /// `rust_only` — the living Markdown.
-pub fn scan_sources(root: &Path, rust_only: bool) -> std::io::Result<Vec<CallSite>> {
-    let mut out = Vec::new();
+pub fn scan_all(root: &Path, rust_only: bool) -> std::io::Result<Scan> {
+    let mut out = Scan::default();
     scan_rust(root, &mut out)?;
     if !rust_only {
-        scan_markdown(root, &mut out)?;
+        scan_markdown(root, &mut out.sites)?;
     }
     Ok(out)
+}
+
+/// The readable call sites only — see [`scan_all`] for the unparsed ones.
+pub fn scan_sources(root: &Path, rust_only: bool) -> std::io::Result<Vec<CallSite>> {
+    Ok(scan_all(root, rust_only)?.sites)
+}
+
+/// Findings for calls the scanner could not read.
+pub fn unparsed_findings(unparsed: &[Unparsed]) -> Vec<Finding> {
+    unparsed
+        .iter()
+        .map(|u| Finding {
+            rule: UNPARSED_RULE,
+            system: u.machine.clone(),
+            unit: format!("{}:{}", u.file.display(), u.line),
+            message: "a call of a.gast/a.gast_mit/a.als whose program (or an argument before it) is not a literal — the scanner cannot check it; name the program as a literal, or except it here with a reason".to_string(),
+            file: Some(u.file.display().to_string()),
+        })
+        .collect()
 }
 
 /// The rule id of every finding `tools` produces.
@@ -476,6 +533,31 @@ mod tests {
         );
         assert!(sites[0].file.ends_with("docs/runbooks/x.md"));
         assert!(scan_sources(&d.0, true).unwrap().is_empty());
+    }
+
+    /// Review 2026-10-23, Important 1+2: a call whose program (or user,
+    /// group, properties) is an identifier is not silently skipped — it is
+    /// reported as unparsed; user/group identifiers in `a.als` are read.
+    #[test]
+    fn identifier_arguments_are_read_or_reported_unparsed() {
+        let d = Dir::new("ident");
+        d.file(
+            "pkgs/gast-pruefung/src/gaeste/ci_01.rs",
+            "fn beides(a: &dyn Ausfuehrer, programm: &str) {\n    a.gast(GAST, programm, &[], None);\n}\n\
+             a.als(GAST, nutzer, \"media\", \"touch\", &[datei]);\n\
+             a.gast_mit(GAST, eigenschaften, \"wc\", &[]);\n",
+        );
+        let scan = scan_all(&d.0, true).unwrap();
+        assert_eq!(
+            pairs(&scan.sites),
+            vec![
+                ("ci-01".to_owned(), "touch".to_owned()),
+                ("ci-01".to_owned(), "wc".to_owned()),
+            ]
+        );
+        assert_eq!(scan.unparsed.len(), 1, "{:?}", scan.unparsed);
+        assert!(scan.unparsed[0].file.ends_with("ci_01.rs"));
+        assert_eq!(scan.unparsed[0].line, 2);
     }
 
     #[test]
