@@ -10,4 +10,5 @@ pub mod live;
 pub mod report;
 pub mod rules;
 pub mod timers;
+pub mod tools;
 pub mod unit;
